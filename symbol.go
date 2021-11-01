@@ -263,6 +263,9 @@ func (pe *File) ParseCOFFSymbolTable() error {
 	size := uint32(binary.Size(COFFSymbol{}))
 	symCount := pe.NtHeader.FileHeader.NumberOfSymbols
 	offset := pe.NtHeader.FileHeader.PointerToSymbolTable
+	if symCount > 1000 {
+		symCount = 1000
+	}
 	symbols := make([]COFFSymbol, symCount)
 
 	for i := uint32(0); i < symCount; i++ {
