@@ -296,6 +296,9 @@ func (pe *File) readUnicodeStringAtRVA(rva uint32, maxLength uint32) string {
 func (pe *File) readASCIIStringAtOffset(offset, maxLength uint32) (uint32, string) {
 	var i uint32
 	str := ""
+	if len(pe.data) < offset || len(pe.data) < offset+maxLength { 
+		return str
+	}
 	buff := pe.data[offset : offset+maxLength]
 	for i = 0; i < maxLength; i++ {
 		if buff[i] == 0 {
