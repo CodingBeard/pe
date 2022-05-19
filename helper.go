@@ -297,7 +297,7 @@ func (pe *File) readASCIIStringAtOffset(offset, maxLength uint32) (uint32, strin
 	var i uint32
 	str := ""
 	if uint32(len(pe.data)) < offset || uint32(len(pe.data)) < offset+maxLength { 
-		return str
+		return i, str
 	}
 	buff := pe.data[offset : offset+maxLength]
 	for i = 0; i < maxLength; i++ {
