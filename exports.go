@@ -1,4 +1,4 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2022 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
@@ -83,19 +83,20 @@ type Export struct {
 	Name      string
 }
 
-// A few notes learned from `Corkami` about parsing export directory:
-// - like many data directories, Exports' size are not necessary, except for
-// forwarding.
-// - Characteristics, TimeDateStamp, MajorVersion and MinorVersion are not necessary.
-// the export name is not necessary, and can be anything.
-// - AddressOfNames is lexicographically-ordered.
-// - export names can have any value (even null or more than 65536 characters
-// long, with unprintable characters), just null terminated.
-// - an EXE can have exports (no need of relocation nor DLL flag), and can use
-// them normally
-// - exports can be not used for execution, but for documenting the internal code
-// - numbers of functions will be different from number of names when the file
-// is exporting some functions by ordinal.
+/*
+A few notes learned from `Corkami` about parsing export directory:
+- like many data directories, Exports' size are not necessary, except for forwarding.
+- Characteristics, TimeDateStamp, MajorVersion and MinorVersion are not necessary.
+- the export name is not necessary, and can be anything.
+- AddressOfNames is lexicographically-ordered.
+- export names can have any value (even null or more than 65536 characters long,
+  with unprintable characters), just null terminated.
+- an EXE can have exports (no need of relocation nor DLL flag), and can use
+them normally
+- exports can be not used for execution, but for documenting the internal code
+- numbers of functions will be different from number of names when the file
+is exporting some functions by ordinal.
+*/
 func (pe *File) parseExportDirectory(rva, size uint32) error {
 
 	// Define some vars.
@@ -103,7 +104,7 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 	exportDir := ImageExportDirectory{}
 	errorMsg := fmt.Sprintf("Error parsing export directory at RVA: 0x%x", rva)
 
-	fileOffset := pe.getOffsetFromRva(rva)
+	fileOffset := pe.GetOffsetFromRva(rva)
 	exportDirSize := uint32(binary.Size(exportDir))
 	err := pe.structUnpack(&exportDir, fileOffset, exportDirSize)
 	if err != nil {
@@ -114,7 +115,7 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 	// We keep track of the bytes left in the file and use it to set a upper
 	// bound in the number of items that can be read from the different arrays.
 	lengthUntilEOF := func(rva uint32) uint32 {
-		return pe.size - pe.getOffsetFromRva(rva)
+		return pe.size - pe.GetOffsetFromRva(rva)
 	}
 	var length uint32
 	var addressOfNames []byte
@@ -122,32 +123,30 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 	// Some DLLs have null number of functions.
 	if exportDir.NumberOfFunctions == 0 {
 		pe.Anomalies = append(pe.Anomalies, AnoNullNumberOfFunctions)
-		return nil
 	}
 
 	// Some DLLs have null address of functions.
 	if exportDir.AddressOfFunctions == 0 {
 		pe.Anomalies = append(pe.Anomalies, AnoNullAddressOfFunctions)
-		return nil
 	}
 
 	length = min(lengthUntilEOF(exportDir.AddressOfNames),
 		exportDir.NumberOfNames*4)
-	addressOfNames, err = pe.getData(exportDir.AddressOfNames, length)
+	addressOfNames, err = pe.GetData(exportDir.AddressOfNames, length)
 	if err != nil {
 		return errors.New(errorMsg)
 	}
 
 	length = min(lengthUntilEOF(exportDir.AddressOfNameOrdinals),
 		exportDir.NumberOfNames*4)
-	addressOfNameOrdinals, err := pe.getData(exportDir.AddressOfNameOrdinals, length)
+	addressOfNameOrdinals, err := pe.GetData(exportDir.AddressOfNameOrdinals, length)
 	if err != nil {
 		return errors.New(errorMsg)
 	}
 
 	length = min(lengthUntilEOF(exportDir.AddressOfFunctions),
 		exportDir.NumberOfFunctions*4)
-	addressOfFunctions, err := pe.getData(exportDir.AddressOfFunctions, length)
+	addressOfFunctions, err := pe.GetData(exportDir.AddressOfFunctions, length)
 	if err != nil {
 		return errors.New(errorMsg)
 	}
@@ -190,7 +189,7 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 		// instead of pointing the the function start address.
 		if symbolAddress >= rva && symbolAddress < rva+size {
 			forwarderStr = pe.getStringAtRVA(symbolAddress, 0x100000)
-			forwarderOffset = pe.getOffsetFromRva(symbolAddress)
+			forwarderOffset = pe.GetOffsetFromRva(symbolAddress)
 		} else {
 			forwarderStr = ""
 			fileOffset = 0
@@ -210,7 +209,7 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 			break
 		}
 
-		symbolNameOffset := pe.getOffsetFromRva(symbolNameAddress)
+		symbolNameOffset := pe.GetOffsetFromRva(symbolNameAddress)
 		if symbolNameOffset == 0 {
 			maxFailedEntries--
 			if maxFailedEntries <= 0 {
@@ -272,7 +271,9 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 			continue
 		}
 
-		symbolAddress = binary.LittleEndian.Uint32(addressOfFunctions[i*4:])
+		if len(addressOfFunctions) >= int(i*4)+4 {
+			symbolAddress = binary.LittleEndian.Uint32(addressOfFunctions[i*4:])
+		}
 		if symbolAddress == 0 {
 			continue
 		}
@@ -280,7 +281,7 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 		// Checking for forwarder again.
 		if symbolAddress >= rva && symbolAddress < rva+size {
 			forwarderStr = pe.getStringAtRVA(symbolAddress, 0x100000)
-			forwarderOffset = pe.getOffsetFromRva(symbolAddress)
+			forwarderOffset = pe.GetOffsetFromRva(symbolAddress)
 		} else {
 			forwarderStr = ""
 			fileOffset = 0
@@ -311,7 +312,8 @@ func (pe *File) parseExportDirectory(rva, size uint32) error {
 		exp.Functions = append(exp.Functions, newExport)
 	}
 
-	pe.Export = &exp
+	pe.Export = exp
+	pe.HasExport = true
 	return nil
 }
 

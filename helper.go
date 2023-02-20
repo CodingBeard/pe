@@ -8,7 +8,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"log"
+	"path"
+	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -28,48 +30,47 @@ var (
 
 	// ErrInvalidPESize is returned when the file size is less that the smallest
 	// PE file size possible.ErrImageOS2SignatureFound
-	ErrInvalidPESize = errors.New("Not a PE file, smaller than tiny PE")
+	ErrInvalidPESize = errors.New("not a PE file, smaller than tiny PE")
 
 	// ErrDOSMagicNotFound is returned when file is potentially a ZM executable.
 	ErrDOSMagicNotFound = errors.New("DOS Header magic not found")
 
 	// ErrInvalidElfanewValue is returned when e_lfanew is larger than file size.
-	ErrInvalidElfanewValue = errors.New(
-		"Invalid e_lfanew value. Probably not a PE file")
+	ErrInvalidElfanewValue = errors.New("invalid e_lfanew value. Probably not a PE file")
 
 	// ErrInvalidNtHeaderOffset is returned when the NT Header offset is beyond
 	// the image file.
 	ErrInvalidNtHeaderOffset = errors.New(
-		"Invalid NT Header Offset. NT Header Signature not found")
+		"invalid NT Header Offset. NT Header Signature not found")
 
 	// ErrImageOS2SignatureFound is returned when signature is for a NE file.
 	ErrImageOS2SignatureFound = errors.New(
-		"Not a valid PE signature. Probably a NE file")
+		"not a valid PE signature. Probably a NE file")
 
 	// ErrImageOS2LESignatureFound is returned when signature is for a LE file.
 	ErrImageOS2LESignatureFound = errors.New(
-		"Not a valid PE signature. Probably an LE file")
+		"not a valid PE signature. Probably an LE file")
 
 	// ErrImageVXDSignatureFound is returned when signature is for a LX file.
 	ErrImageVXDSignatureFound = errors.New(
-		"Not a valid PE signature. Probably an LX file")
+		"not a valid PE signature. Probably an LX file")
 
 	// ErrImageTESignatureFound is returned when signature is for a TE file.
 	ErrImageTESignatureFound = errors.New(
-		"Not a valid PE signature. Probably a TE file")
+		"not a valid PE signature. Probably a TE file")
 
 	// ErrImageNtSignatureNotFound is returned when PE magic signature is not found.
 	ErrImageNtSignatureNotFound = errors.New(
-		"Not a valid PE signature. Magic not found")
+		"not a valid PE signature. Magic not found")
 
 	// ErrImageNtOptionalHeaderMagicNotFound is returned when optional header
 	// magic is different from PE32/PE32+.
 	ErrImageNtOptionalHeaderMagicNotFound = errors.New(
-		"Not a valid PE signature. Optional Header magic not found")
+		"not a valid PE signature. Optional Header magic not found")
 
 	// ErrImageBaseNotAligned is reported when the image base is not aligned to 64K.
 	ErrImageBaseNotAligned = errors.New(
-		"Corrupt PE file. Image base not aligned to 64 K")
+		"corrupt PE file. Image base not aligned to 64 K")
 
 	// AnoImageBaseOverflow is reported when the image base + SizeOfImage is
 	// larger than 80000000h/FFFF080000000000h in PE32/P32+.
@@ -77,7 +78,7 @@ var (
 
 	// ErrInvalidSectionFileAlignment is reported when section alignment is less than a
 	// PAGE_SIZE and section alignement != file alignment.
-	ErrInvalidSectionFileAlignment = errors.New("Corrupt PE file. Section " +
+	ErrInvalidSectionFileAlignment = errors.New("corrupt PE file. Section " +
 		"alignment is less than a PAGE_SIZE and section alignement != file alignment")
 
 	// AnoInvalidSizeOfImage is reported when SizeOfImage is not multiple of
@@ -87,7 +88,7 @@ var (
 
 	// ErrOutsideBoundary is reported when attempting to read an address beyond
 	// file image limits.
-	ErrOutsideBoundary = errors.New("Reading data outside boundary")
+	ErrOutsideBoundary = errors.New("reading data outside boundary")
 )
 
 // Max returns the larger of x or y.
@@ -179,7 +180,7 @@ func (pe *File) getSectionByRva(rva uint32) *Section {
 func (pe *File) getSectionNameByRva(rva uint32) string {
 	for _, section := range pe.Sections {
 		if section.Contains(rva, pe) {
-			return section.NameString()
+			return section.String()
 		}
 	}
 	return ""
@@ -201,8 +202,8 @@ func (pe *File) getSectionByOffset(offset uint32) *Section {
 	return nil
 }
 
-// getOffsetFromRva returns the file offset corresponding to this RVA.
-func (pe *File) getOffsetFromRva(rva uint32) uint32 {
+// GetOffsetFromRva returns the file offset corresponding to this RVA.
+func (pe *File) GetOffsetFromRva(rva uint32) uint32 {
 
 	// Given a RVA, this method will find the section where the
 	// data lies and return the offset within the file.
@@ -218,7 +219,8 @@ func (pe *File) getOffsetFromRva(rva uint32) uint32 {
 	return rva - sectionAlignment + fileAlignment
 }
 
-func (pe *File) getRvaFromOffset(offset uint32) uint32 {
+// GetRVAFromOffset retuns an RVA given an offset.
+func (pe *File) GetRVAFromOffset(offset uint32) uint32 {
 	section := pe.getSectionByOffset(offset)
 	minAddr := ^uint32(0)
 	if section == nil {
@@ -242,7 +244,7 @@ func (pe *File) getRvaFromOffset(offset uint32) uint32 {
 			return offset
 		}
 
-		log.Println("data at Offset can't be fetched. Corrupt header?")
+		pe.logger.Warn("data at Offset can't be fetched. Corrupt header?")
 		return ^uint32(0)
 	}
 	sectionAlignment := pe.adjustSectionAlignment(section.Header.VirtualAddress)
@@ -252,7 +254,7 @@ func (pe *File) getRvaFromOffset(offset uint32) uint32 {
 
 func (pe *File) getSectionByName(secName string) (section *ImageSectionHeader) {
 	for _, section := range pe.Sections {
-		if section.NameString() == secName {
+		if section.String() == secName {
 			return &section.Header
 		}
 
@@ -284,27 +286,29 @@ func (pe *File) getStringAtRVA(rva, maxLen uint32) string {
 }
 
 func (pe *File) readUnicodeStringAtRVA(rva uint32, maxLength uint32) string {
-	unicodeString := ""
-	offset := pe.getOffsetFromRva(rva)
-	buff := pe.data[offset : offset+(maxLength*2)]
-	for i := uint32(0); i < maxLength*2; i += 2 {
-		unicodeString += string(buff[i])
+	str := ""
+	offset := pe.GetOffsetFromRva(rva)
+	i := uint32(0)
+	for i = 0; i < maxLength; i += 2 {
+		if offset+i >= pe.size || pe.data[offset+i] == 0 {
+			break
+		}
+
+		str += string(pe.data[offset+i])
 	}
-	return unicodeString
+	return str
 }
 
 func (pe *File) readASCIIStringAtOffset(offset, maxLength uint32) (uint32, string) {
-	var i uint32
 	str := ""
-	if uint32(len(pe.data)) < offset || uint32(len(pe.data)) < offset+maxLength { 
-		return i, str
-	}
-	buff := pe.data[offset : offset+maxLength]
+	i := uint32(0)
+
 	for i = 0; i < maxLength; i++ {
-		if buff[i] == 0 {
+		if offset+i >= pe.size || pe.data[offset+i] == 0 {
 			break
 		}
-		str += string(buff[i])
+
+		str += string(pe.data[offset+i])
 	}
 	return i, str
 }
@@ -341,9 +345,9 @@ func (pe *File) getStringAtOffset(offset, size uint32) (string, error) {
 	return strings.Replace(str, "\x00", "", -1), nil
 }
 
-// getData returns the data given an RVA regardless of the section where it
+// GetData returns the data given an RVA regardless of the section where it
 // lies on.
-func (pe *File) getData(rva, length uint32) ([]byte, error) {
+func (pe *File) GetData(rva, length uint32) ([]byte, error) {
 
 	// Given a RVA and the size of the chunk to retrieve, this method
 	// will find the section where the data lies and return the data.
@@ -417,15 +421,19 @@ func (pe *File) adjustSectionAlignment(va uint32) uint32 {
 	switch pe.Is64 {
 	case true:
 		fileAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader64).FileAlignment
-		sectionAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader64).FileAlignment
+		sectionAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader64).SectionAlignment
 	case false:
-		fileAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader32).SectionAlignment
+		fileAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader32).FileAlignment
 		sectionAlignment = pe.NtHeader.OptionalHeader.(ImageOptionalHeader32).SectionAlignment
 	}
 
 	if fileAlignment < FileAlignmentHardcodedValue &&
 		fileAlignment != sectionAlignment {
 		pe.Anomalies = append(pe.Anomalies, ErrInvalidSectionAlignment)
+	}
+
+	if sectionAlignment < 0x1000 { // page size
+		sectionAlignment = fileAlignment
 	}
 
 	// 0x200 is the minimum valid FileAlignment according to the documentation
@@ -501,7 +509,7 @@ func (pe *File) IsDriver() bool {
 	}
 	commonDriverSectionNames := []string{"page", "paged", "nonpage", "init"}
 	for _, section := range pe.Sections {
-		s := strings.ToLower(section.NameString())
+		s := strings.ToLower(section.String())
 		if stringInSlice(s, commonDriverSectionNames) &&
 			(subsystem&ImageSubsystemNativeWindows != 0 ||
 				subsystem&ImageSubsystemNative != 0) {
@@ -515,10 +523,7 @@ func (pe *File) IsDriver() bool {
 
 // IsDLL returns true if the PE file is a standard DLL.
 func (pe *File) IsDLL() bool {
-	if pe.NtHeader.FileHeader.Characteristics&ImageFileDLL != 0 {
-		return true
-	}
-	return false
+	return pe.NtHeader.FileHeader.Characteristics&ImageFileDLL != 0
 }
 
 // IsEXE returns true if the PE file is a standard executable.
@@ -537,29 +542,15 @@ func (pe *File) IsEXE() bool {
 	return true
 }
 
-// padOrTrim returns (size) bytes from input (bb)
-// Short bb gets zeros prefixed, Long bb gets left/MSB bits trimmed
-func padOrTrim(bb []byte, size int) []byte {
-	l := len(bb)
-	if l == size {
-		return bb
-	}
-	if l > size {
-		return bb[l-size:]
-	}
-	tmp := make([]byte, size)
-	copy(tmp[size-l:], bb)
-	return tmp
-}
-
 // Checksum calculates the PE checksum as generated by CheckSumMappedFile().
 func (pe *File) Checksum() uint32 {
-	checksum := 0
-	max := 0x100000000
+	var checksum uint64 = 0
+	var max uint64 = 0x100000000
 	currentDword := uint32(0)
 
 	// Get the Checksum offset.
-	optionalHeaderOffset := pe.DosHeader.AddressOfNewEXEHeader + uint32(binary.Size(pe.NtHeader))
+	optionalHeaderOffset := pe.DOSHeader.AddressOfNewEXEHeader + 4 +
+		uint32(binary.Size(pe.NtHeader.FileHeader))
 
 	// `CheckSum` field position in optional PE headers is always 64 for PE and PE+.
 	checksumOffset := optionalHeaderOffset + 64
@@ -569,24 +560,21 @@ func (pe *File) Checksum() uint32 {
 	dataLen := pe.size
 	if remainder > 0 {
 		dataLen = pe.size + (4 - remainder)
+		paddedBytes := make([]byte, 4-remainder)
+		pe.data = append(pe.data, paddedBytes...)
 	}
 
-	for i := uint32(0); i < dataLen/4; i++ {
-		// Skip the checksum field
-		if i*4 == checksumOffset {
+	for i := uint32(0); i < dataLen; i += 4 {
+		// Skip the checksum field.
+		if i == checksumOffset {
 			continue
 		}
 
-		// Did we reach the last dword ?
-		if i+1 == dataLen/4 && remainder > 0 {
-			bb := pe.data[i*4 : i*4+(4-remainder)]
-			lastDword := padOrTrim(bb, 4)
-			currentDword = binary.LittleEndian.Uint32(lastDword)
-		} else {
-			currentDword = binary.LittleEndian.Uint32(pe.data[i*4:])
-		}
+		// Read DWORD from file.
+		currentDword = binary.LittleEndian.Uint32(pe.data[i:])
 
-		checksum += int(currentDword)
+		// Calculate checksum.
+		checksum = (checksum & 0xffffffff) + uint64(currentDword) + (checksum >> 32)
 		if checksum > max {
 			checksum = (checksum & 0xffffffff) + (checksum >> 32)
 		}
@@ -597,7 +585,7 @@ func (pe *File) Checksum() uint32 {
 	checksum = checksum & 0xffff
 
 	// The length is the one of the original data, not the padded one
-	checksum += int(pe.size)
+	checksum += uint64(pe.size)
 
 	return uint32(checksum)
 }
@@ -613,7 +601,7 @@ func (pe *File) ReadUint64(offset uint32) (uint64, error) {
 
 // ReadUint32 read a uint32 from a buffer.
 func (pe *File) ReadUint32(offset uint32) (uint32, error) {
-	if offset+4 > pe.size {
+	if offset > pe.size-4 {
 		return 0, ErrOutsideBoundary
 	}
 
@@ -622,7 +610,7 @@ func (pe *File) ReadUint32(offset uint32) (uint32, error) {
 
 // ReadUint16 read a uint16 from a buffer.
 func (pe *File) ReadUint16(offset uint32) (uint16, error) {
-	if offset+2 > pe.size {
+	if offset > pe.size-2 {
 		return 0, ErrOutsideBoundary
 	}
 
@@ -681,4 +669,9 @@ func (pe *File) ReadBytesAtOffset(offset, size uint32) ([]byte, error) {
 func IsBitSet(n uint64, pos int) bool {
 	val := n & (1 << pos)
 	return (val > 0)
+}
+
+func getAbsoluteFilePath(testfile string) string {
+	_, p, _, _ := runtime.Caller(0)
+	return path.Join(filepath.Dir(p), testfile)
 }

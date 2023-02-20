@@ -1,4 +1,4 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2018 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
@@ -99,7 +99,7 @@ const (
 	ImageFileLocalSymsStripped = 0x0008
 
 	// Aggressively trim the working set.
-	ImageFileAgressibeWsTrim = 0x0010
+	ImageFileAggressiveWSTrim = 0x0010
 
 	// Application can handle addresses beyond the 2GB range. This flag should
 	// not be set for pure-IL managed PE files of versions 1.0 and 1.1 but can
@@ -176,23 +176,54 @@ const (
 
 )
 
+// ImageDirectoryEntry represents an entry inside the data directories.
+type ImageDirectoryEntry int
+
 // DataDirectory entries of an OptionalHeader
 const (
-	ImageDirectoryEntryExport       = 0  // Export Table
-	ImageDirectoryEntryImport       = 1  // Import Table
-	ImageDirectoryEntryResource     = 2  // Resource Table
-	ImageDirectoryEntryException    = 3  // Exception Table
-	ImageDirectoryEntryCertificate  = 4  // Certificate Directory
-	ImageDirectoryEntryBaseReloc    = 5  // Base Relocation Table
-	ImageDirectoryEntryDebug        = 6  // Debug
-	ImageDirectoryEntryArchitecture = 7  // Architecture Specific Data
-	ImageDirectoryEntryGlobalPtr    = 8  // The RVA of the value to be stored in the global pointer register.
-	ImageDirectoryEntryTLS          = 9  // The thread local storage (TLS) table
-	ImageDirectoryEntryLoadConfig   = 10 // The load configuration table
-	ImageDirectoryEntryBoundImport  = 11 // The bound import table
-	ImageDirectoryEntryIAT          = 12 // Import Address Table
-	ImageDirectoryEntryDelayImport  = 13 // Delay Import Descriptor
-	ImageDirectoryEntryCLR          = 14 // CLR Runtime Header
-	ImageDirectoryEntryReserved     = 15 // Must be zero
-	ImageNumberOfDirectoryEntries   = 16 // Tables count.
+	ImageDirectoryEntryExport       ImageDirectoryEntry = iota // Export Table
+	ImageDirectoryEntryImport                                  // Import Table
+	ImageDirectoryEntryResource                                // Resource Table
+	ImageDirectoryEntryException                               // Exception Table
+	ImageDirectoryEntryCertificate                             // Certificate Directory
+	ImageDirectoryEntryBaseReloc                               // Base Relocation Table
+	ImageDirectoryEntryDebug                                   // Debug
+	ImageDirectoryEntryArchitecture                            // Architecture Specific Data
+	ImageDirectoryEntryGlobalPtr                               // The RVA of the value to be stored in the global pointer register.
+	ImageDirectoryEntryTLS                                     // The thread local storage (TLS) table
+	ImageDirectoryEntryLoadConfig                              // The load configuration table
+	ImageDirectoryEntryBoundImport                             // The bound import table
+	ImageDirectoryEntryIAT                                     // Import Address Table
+	ImageDirectoryEntryDelayImport                             // Delay Import Descriptor
+	ImageDirectoryEntryCLR                                     // CLR Runtime Header
+	ImageDirectoryEntryReserved                                // Must be zero
+	ImageNumberOfDirectoryEntries                              // Tables count.
 )
+
+// FileInfo represents the PE file information struct.
+type FileInfo struct {
+	Is32           bool
+	Is64           bool
+	HasDOSHdr      bool
+	HasRichHdr     bool
+	HasCOFF        bool
+	HasNTHdr       bool
+	HasSections    bool
+	HasExport      bool
+	HasImport      bool
+	HasResource    bool
+	HasException   bool
+	HasCertificate bool
+	HasReloc       bool
+	HasDebug       bool
+	HasArchitect   bool
+	HasGlobalPtr   bool
+	HasTLS         bool
+	HasLoadCFG     bool
+	HasBoundImp    bool
+	HasIAT         bool
+	HasDelayImp    bool
+	HasCLR         bool
+	HasOverlay     bool
+	IsSigned       bool
+}

@@ -1,3 +1,7 @@
+// Copyright 2018 Saferwall. All rights reserved.
+// Use of this source code is governed by Apache v2 license
+// license that can be found in the LICENSE file.
+
 package pe
 
 import (
@@ -8,6 +12,17 @@ import (
 )
 
 const (
+
+	// MaxDefaultSymbolsCount represents the default maximum number of COFF
+	// symbols to parse. Some malware uses a fake huge NumberOfSymbols that
+	// can cause an OOM exception.
+	// Example: 0000e876c5b712b6b7b3ce97f757ddd918fb3dbdc5a3938e850716fbd841309f
+	MaxDefaultCOFFSymbolsCount = 0x10000
+
+	// MaxCOFFSymStrLength represents the maximum string length of a COFF symbol
+	// to read.
+	MaxCOFFSymStrLength = 0x50
+
 	//
 	// Type Representation
 	//
@@ -198,9 +213,14 @@ const (
 )
 
 var (
-	errCOFFTableNotPresent   = errors.New("PE image does not countains a COFF symbol table")
-	errNoCOFFStringInTable   = errors.New("PE image got a PointerToSymbolTable but no string in the COFF string table")
-	errCOFFSymbolOutOfBounds = errors.New("COFF symbol offset out of bounds")
+	errCOFFTableNotPresent = errors.New(
+		"PE image does not contains a COFF symbol table")
+	errNoCOFFStringInTable = errors.New(
+		"PE image got a PointerToSymbolTable but no string in the COFF string table")
+	errCOFFSymbolOutOfBounds = errors.New(
+		"COFF symbol offset out of bounds")
+	errCOFFSymbolsTooHigh = errors.New(
+		"COFF symbols count is absurdly high")
 )
 
 // COFFSymbol represents an entry in the COFF symbol table, which it is an
@@ -218,33 +238,38 @@ type COFFSymbol struct {
 	//    } Name;
 	//    DWORD   LongName[2];    // PBYTE  [2]
 	// } N;
-	Name [8]byte
+	Name [8]byte `json:"name"`
 
 	// The value that is associated with the symbol. The interpretation of this
 	// field depends on SectionNumber and StorageClass. A typical meaning is
 	// the relocatable address.
-	Value uint32
+	Value uint32 `json:"value"`
 
 	// The signed integer that identifies the section, using a one-based index
-	// into the section table. Some values have special meaning, as defined in section 5.4.2, "Section Number Values."
-	SectionNumber int16
+	// into the section table. Some values have special meaning.
+	// See "Section Number Values."
+	SectionNumber int16 `json:"section_number"`
 
-	// A number that represents type. Microsoft tools set this field to 0x20 (function) or 0x0 (not a function). For more information, see Type Representation.
-	Type uint16
+	// A number that represents type. Microsoft tools set this field to
+	// 0x20 (function) or 0x0 (not a function). For more information,
+	// see Type Representation.
+	Type uint16 `json:"type"`
 
-	// An enumerated value that represents storage class. For more information, see Storage Class.
-	StorageClass uint8
+	// An enumerated value that represents storage class.
+	// For more information, see Storage Class.
+	StorageClass uint8 `json:"storage_class"`
 
 	// The number of auxiliary symbol table entries that follow this record.
-	NumberOfAuxSymbols uint8
+	NumberOfAuxSymbols uint8 `json:"number_of_aux_symbols"`
 }
 
 // COFF holds properties related to the COFF format.
 type COFF struct {
-	SymbolTable       []COFFSymbol
-	StringTable       []string
-	StringTableOffset uint32
-	StringTableM      map[uint32]string // Map the symbol offset => symbol name.
+	SymbolTable       []COFFSymbol `json:"symbol_table"`
+	StringTable       []string     `json:"string_table"`
+	StringTableOffset uint32       `json:"string_table_offset"`
+	// Map the symbol offset => symbol name.
+	StringTableM map[uint32]string `json:"-"`
 }
 
 // ParseCOFFSymbolTable parses the COFF symbol table. The symbol table is
@@ -260,14 +285,24 @@ func (pe *File) ParseCOFFSymbolTable() error {
 		return errCOFFTableNotPresent
 	}
 
-	size := uint32(binary.Size(COFFSymbol{}))
 	symCount := pe.NtHeader.FileHeader.NumberOfSymbols
-	offset := pe.NtHeader.FileHeader.PointerToSymbolTable
-	if symCount > 1000 {
-		symCount = 1000
+	if symCount == 0 {
+		return nil
 	}
+	if symCount > pe.opts.MaxCOFFSymbolsCount {
+		pe.addAnomaly(AnoCOFFSymbolsCount)
+		return errCOFFSymbolsTooHigh
+	}
+
+	// The location of the symbol table is indicated in the COFF header.
+	offset := pe.NtHeader.FileHeader.PointerToSymbolTable
+
+	// The symbol table is an array of records, each 18 bytes long.
+	size := uint32(binary.Size(COFFSymbol{}))
 	symbols := make([]COFFSymbol, symCount)
 
+	// Each record is either a standard or auxiliary symbol-table record.
+	// A standard record defines a symbol or name and has the COFFSymbol STRUCT format.
 	for i := uint32(0); i < symCount; i++ {
 		err := pe.structUnpack(&symbols[i], offset, size)
 		if err != nil {
@@ -276,12 +311,12 @@ func (pe *File) ParseCOFFSymbolTable() error {
 		offset += size
 	}
 
-	pe.COFF = &COFF{}
 	pe.COFF.SymbolTable = symbols
 
 	// Get the COFF string table.
 	pe.COFFStringTable()
 
+	pe.HasCOFF = true
 	return nil
 }
 
@@ -294,19 +329,27 @@ func (pe *File) COFFStringTable() error {
 		return errCOFFTableNotPresent
 	}
 
+	symCount := pe.NtHeader.FileHeader.NumberOfSymbols
+	if symCount == 0 {
+		return nil
+	}
+	if symCount > pe.opts.MaxCOFFSymbolsCount {
+		pe.addAnomaly(AnoCOFFSymbolsCount)
+		return errCOFFSymbolsTooHigh
+	}
+
 	// COFF String Table immediately following the COFF symbol table. The
 	// position of this table is found by taking the symbol table address in
 	// the COFF header and adding the number of symbols multiplied by the size
 	// of a symbol.
 	size := uint32(binary.Size(COFFSymbol{}))
-	symCount := pe.NtHeader.FileHeader.NumberOfSymbols
 	offset := pointerToSymbolTable + (size * symCount)
-	pe.COFF.StringTableOffset = offset
 
 	// At the beginning of the COFF string table are 4 bytes that contain the
 	// total size (in bytes) of the rest of the string table. This size
 	// includes the size field itself, so that the value in this location would
 	// be 4 if no strings were present.
+	pe.COFF.StringTableOffset = offset
 	strTableSize, err := pe.ReadUint32(offset)
 	if err != nil {
 		return err
@@ -319,9 +362,9 @@ func (pe *File) COFFStringTable() error {
 	// Following the size are null-terminated strings that are pointed to by
 	// symbols in the COFF symbol table. We create a map to map offset to
 	// string.
-	end := offset + strTableSize
-	for offset <= end {
-		len, str := pe.readASCIIStringAtOffset(offset, 0x30)
+	end := offset + strTableSize - 4
+	for offset < end {
+		len, str := pe.readASCIIStringAtOffset(offset, MaxCOFFSymStrLength)
 		if len == 0 {
 			break
 		}
@@ -334,13 +377,14 @@ func (pe *File) COFFStringTable() error {
 	return nil
 }
 
-// String returns represenation of the symbol name.
+// String returns the representation of the symbol name.
 func (symbol *COFFSymbol) String(pe *File) (string, error) {
-	// contain the name itself, if it is not more than 8 bytes long, or the
-	// ShortName field gives an offset into the string table. To determine
-	// whether the name itself or an offset is given, test the first 4
-	// bytes for equality to zero.
 	var short, long uint32
+
+	// The ShortName field in a symbol table consists of 8 bytes
+	// that contain the name itself, if it is not more than 8
+	// bytes long, or the ShortName field gives an offset into
+	// the string table.
 	highDw := bytes.NewBuffer(symbol.Name[4:])
 	lowDw := bytes.NewBuffer(symbol.Name[:4])
 	errl := binary.Read(lowDw, binary.LittleEndian, &short)
@@ -349,7 +393,8 @@ func (symbol *COFFSymbol) String(pe *File) (string, error) {
 		return "", errCOFFSymbolOutOfBounds
 	}
 
-	// if 0, use LongName.
+	// To determine whether the name itself or an offset is given,
+	// test the first 4 bytes for equality to zero.
 	if short != 0 {
 		name := strings.Replace(string(symbol.Name[:]), "\x00", "", -1)
 		return name, nil
@@ -370,7 +415,7 @@ func (symbol *COFFSymbol) SectionNumberName(pe *File) string {
 	// and can take negative values. The following values, less than one, have
 	// special meanings.
 	if symbol.SectionNumber > 0 && symbol.SectionNumber < int16(len(pe.Sections)) {
-		return pe.Sections[symbol.SectionNumber-1].NameString()
+		return pe.Sections[symbol.SectionNumber-1].String()
 	}
 
 	switch symbol.SectionNumber {
@@ -387,8 +432,8 @@ func (symbol *COFFSymbol) SectionNumberName(pe *File) string {
 
 // PrettyCOFFTypeRepresentation returns the string representation of the `Type`
 // field of a COFF table entry.
-func (pe *File) PrettyCOFFTypeRepresentation(k uint8) string {
-	coffSymTypeMap := map[uint8]string{
+func (pe *File) PrettyCOFFTypeRepresentation(k uint16) string {
+	coffSymTypeMap := map[uint16]string{
 		ImageSymTypeNull:   "Null",
 		ImageSymTypeVoid:   "Void",
 		ImageSymTypeChar:   "Char",

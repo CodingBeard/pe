@@ -1,4 +1,4 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2018 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
@@ -58,7 +58,7 @@ type ImageDelayImportDescriptor struct {
 type DelayImport struct {
 	Offset     uint32
 	Name       string
-	Functions  []*ImportFunction
+	Functions  []ImportFunction
 	Descriptor ImageDelayImportDescriptor
 }
 
@@ -69,7 +69,7 @@ type DelayImport struct {
 func (pe *File) parseDelayImportDirectory(rva, size uint32) error {
 	for {
 		importDelayDesc := ImageDelayImportDescriptor{}
-		fileOffset := pe.getOffsetFromRva(rva)
+		fileOffset := pe.GetOffsetFromRva(rva)
 		importDescSize := uint32(binary.Size(importDelayDesc))
 		err := pe.structUnpack(&importDelayDesc, fileOffset, importDescSize)
 
@@ -102,7 +102,7 @@ func (pe *File) parseDelayImportDirectory(rva, size uint32) error {
 			}
 		}
 
-		var importedFunctions []*ImportFunction
+		var importedFunctions []ImportFunction
 		if pe.Is64 {
 			importedFunctions, err = pe.parseImports64(&importDelayDesc, maxLen)
 		} else {
@@ -131,7 +131,10 @@ func (pe *File) parseDelayImportDirectory(rva, size uint32) error {
 			Functions:  importedFunctions,
 			Descriptor: importDelayDesc,
 		})
+	}
 
+	if len(pe.DelayImports) > 0 {
+		pe.HasDelayImp = true
 	}
 
 	return nil

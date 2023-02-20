@@ -1,18 +1,27 @@
-// Copyright 2021 Saferwall. All rights reserved.
+// Copyright 2018 Saferwall. All rights reserved.
 // Use of this source code is governed by Apache v2 license
 // license that can be found in the LICENSE file.
 
 package pe
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
+	"strings"
 	"time"
-	"unsafe"
 
 	"go.mozilla.org/pkcs7"
 )
@@ -45,32 +54,35 @@ const (
 	WinCertTypeReserved1 = 0x0003
 
 	// Terminal Server Protocol Stack Certificate signing (Not Supported).
-	WinCertTypeTsStackSigned = 0x0004
+	WinCertTypeTSStackSigned = 0x0004
 )
 
 var (
-	errSecurityDataDirOutOfBands = errors.New(
-		`Boundary checks failed in security data directory`)
+	// ErrSecurityDataDirInvalidCertHeader is reported when the certificate
+	// header in the security directory is invalid.
+	ErrSecurityDataDirInvalid = errors.New(
+		`invalid certificate header in security directory`)
 )
 
 // Certificate directory.
 type Certificate struct {
-	Header   WinCertificate
-	Content  *pkcs7.PKCS7 `json:"-"`
-	Info     CertInfo
-	Verified bool
+	Header   WinCertificate `json:"header"`
+	Content  pkcs7.PKCS7    `json:"-"`
+	Raw      []byte         `json:"-"`
+	Info     CertInfo       `json:"info"`
+	Verified bool           `json:"verified"`
 }
 
 // WinCertificate encapsulates a signature used in verifying executable files.
 type WinCertificate struct {
 	// Specifies the length, in bytes, of the signature.
-	Length uint32
+	Length uint32 `json:"length"`
 
 	// Specifies the certificate revision.
-	Revision uint16
+	Revision uint16 `json:"revision"`
 
 	// Specifies the type of certificate.
-	CertificateType uint16
+	CertificateType uint16 `json:"certificate_type"`
 }
 
 // CertInfo wraps the important fields of the pkcs7 structure.
@@ -78,120 +90,190 @@ type WinCertificate struct {
 type CertInfo struct {
 	// The certificate authority (CA) that charges customers to issue
 	// certificates for them.
-	Issuer string
+	Issuer string `json:"issuer"`
 
 	// The subject of the certificate is the entity its public key is associated
 	// with (i.e. the "owner" of the certificate).
-	Subject string
+	Subject string `json:"subject"`
+
+	// The certificate won't be valid before this timestamp.
+	NotBefore time.Time `json:"not_before"`
 
 	// The certificate won't be valid after this timestamp.
-	NotBefore time.Time
+	NotAfter time.Time `json:"not_after"`
 
-	// The certificate won't be valid after this timestamp.
-	NotAfter time.Time
+	// The serial number MUST be a positive integer assigned by the CA to each
+	// certificate. It MUST be unique for each certificate issued by a given CA
+	// (i.e., the issuer name and serial number identify a unique certificate).
+	// CAs MUST force the serialNumber to be a non-negative integer.
+	// For convenience, we convert the big int to string.
+	SerialNumber string `json:"serial_number"`
+
+	// The identifier for the cryptographic algorithm used by the CA to sign
+	// this certificate.
+	SignatureAlgorithm x509.SignatureAlgorithm `json:"signature_algorithm"`
+
+	// The Public Key Algorithm refers to the public key inside the certificate.
+	// This certificate is used together with the matching private key to prove
+	// the identity of the peer.
+	PublicKeyAlgorithm x509.PublicKeyAlgorithm `json:"public_key_algorithm"`
+}
+
+type RelRange struct {
+	Start  uint32
+	Length uint32
+}
+
+type byStart []RelRange
+
+func (s byStart) Len() int      { return len(s) }
+func (s byStart) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s byStart) Less(i, j int) bool {
+	return s[i].Start < s[j].Start
+}
+
+type Range struct {
+	Start uint32
+	End   uint32
+}
+
+func (pe *File) parseLocations() (map[string]*RelRange, error) {
+	location := make(map[string]*RelRange, 3)
+
+	fileHdrSize := uint32(binary.Size(pe.NtHeader.FileHeader))
+	optionalHeaderOffset := pe.DOSHeader.AddressOfNewEXEHeader + 4 + fileHdrSize
+
+	var (
+		oh32 ImageOptionalHeader32
+		oh64 ImageOptionalHeader64
+
+		optionalHeaderSize uint32
+	)
+
+	switch pe.Is64 {
+	case true:
+		oh64 = pe.NtHeader.OptionalHeader.(ImageOptionalHeader64)
+		optionalHeaderSize = oh64.SizeOfHeaders
+	case false:
+		oh32 = pe.NtHeader.OptionalHeader.(ImageOptionalHeader32)
+		optionalHeaderSize = oh32.SizeOfHeaders
+	}
+
+	if optionalHeaderSize > pe.size-optionalHeaderOffset {
+		msgF := "the optional header exceeds the file length (%d + %d > %d)"
+		return nil, fmt.Errorf(msgF, optionalHeaderSize, optionalHeaderOffset, pe.size)
+	}
+
+	if optionalHeaderSize < 68 {
+		msgF := "the optional header size is %d < 68, which is insufficient for authenticode"
+		return nil, fmt.Errorf(msgF, optionalHeaderSize)
+	}
+
+	// The location of the checksum
+	location["checksum"] = &RelRange{optionalHeaderOffset + 64, 4}
+
+	var rvaBase, certBase, numberOfRvaAndSizes uint32
+	switch pe.Is64 {
+	case true:
+		rvaBase = optionalHeaderOffset + 108
+		certBase = optionalHeaderOffset + 144
+		numberOfRvaAndSizes = oh64.NumberOfRvaAndSizes
+	case false:
+		rvaBase = optionalHeaderOffset + 92
+		certBase = optionalHeaderOffset + 128
+		numberOfRvaAndSizes = oh32.NumberOfRvaAndSizes
+	}
+
+	if optionalHeaderOffset+optionalHeaderSize < rvaBase+4 {
+		pe.logger.Debug("The PE Optional Header size can not accommodate for the NumberOfRvaAndSizes field")
+		return location, nil
+	}
+
+	if numberOfRvaAndSizes < uint32(5) {
+		pe.logger.Debugf("The PE Optional Header does not have a Certificate Table entry in its "+
+			"Data Directory; NumberOfRvaAndSizes = %d", numberOfRvaAndSizes)
+		return location, nil
+	}
+
+	if optionalHeaderOffset+optionalHeaderSize < certBase+8 {
+		pe.logger.Debug("The PE Optional Header size can not accommodate for a Certificate Table" +
+			"entry in its Data Directory")
+		return location, nil
+	}
+
+	// The location of the entry of the Certificate Table in the Data Directory
+	location["datadir_certtable"] = &RelRange{certBase, 8}
+
+	var address, size uint32
+	switch pe.Is64 {
+	case true:
+		dirEntry := oh64.DataDirectory[ImageDirectoryEntryCertificate]
+		address = dirEntry.VirtualAddress
+		size = dirEntry.Size
+	case false:
+		dirEntry := oh32.DataDirectory[ImageDirectoryEntryCertificate]
+		address = dirEntry.VirtualAddress
+		size = dirEntry.Size
+	}
+
+	if size == 0 {
+		pe.logger.Debug("The Certificate Table is empty")
+		return location, nil
+	}
+
+	if int64(address) < int64(optionalHeaderSize)+int64(optionalHeaderOffset) ||
+		int64(address)+int64(size) > int64(pe.size) {
+		pe.logger.Debugf("The location of the Certificate Table in the binary makes no sense and "+
+			"is either beyond the boundaries of the file, or in the middle of the PE header; "+
+			"VirtualAddress: %x, Size: %x", address, size)
+		return location, nil
+	}
+
+	// The location of the Certificate Table
+	location["certtable"] = &RelRange{address, size}
+	return location, nil
 }
 
 // Authentihash generates the pe image file hash.
 // The relevant sections to exclude during hashing are:
-// 	- The location of the checksum
-//  - The location of the entry of the Certificate Table in the Data Directory
-//	- The location of the Certificate Table.
+//   - The location of the checksum
+//   - The location of the entry of the Certificate Table in the Data Directory
+//   - The location of the Certificate Table.
 func (pe *File) Authentihash() []byte {
 
-	// Declare some vars.
-	var certDirSize uint32
-	var sizeOfHeaders uint32
-	var dataDirOffset uint32
-
-	// Initialize a hash algorithm context.
-	h := sha256.New()
-
-	// Hash the image header from its base to immediately before the start of
-	// the checksum address, as specified in Optional Header Windows-Specific
-	// Fields.
-	start := uint32(0)
-	fileHdrSize := uint32(binary.Size(pe.NtHeader.FileHeader))
-	optionalHeaderOffset := pe.DosHeader.AddressOfNewEXEHeader + 4 + fileHdrSize
-	checksumOffset := optionalHeaderOffset + 64
-	h.Write(pe.data[start:checksumOffset])
-
-	// Skip over the checksum, which is a 4-byte field.
-	start += checksumOffset + uint32(4)
-
-	// Hash everything from the end of the checksum field to immediately before
-	// the start of the Certificate Table entry, as specified in Optional Header
-	// Data Directories.
-	oh32 := ImageOptionalHeader32{}
-	oh64 := ImageOptionalHeader64{}
-	switch pe.Is64 {
-	case true:
-		oh64 = pe.NtHeader.OptionalHeader.(ImageOptionalHeader64)
-		certDirSize = oh64.DataDirectory[ImageDirectoryEntryCertificate].Size
-		sizeOfHeaders = oh64.SizeOfHeaders
-		dataDirOffset = uint32(unsafe.Offsetof(oh64.DataDirectory))
-	case false:
-		oh32 = pe.NtHeader.OptionalHeader.(ImageOptionalHeader32)
-		certDirSize = oh32.DataDirectory[ImageDirectoryEntryCertificate].Size
-		sizeOfHeaders = oh32.SizeOfHeaders
-		dataDirOffset = uint32(unsafe.Offsetof(oh32.DataDirectory))
+	locationMap, err := pe.parseLocations()
+	if err != nil {
+		return nil
 	}
-	securityDirOffset := optionalHeaderOffset + dataDirOffset
-	securityDirOffset += uint32(
-		binary.Size(DataDirectory{}) * ImageDirectoryEntryCertificate)
-	h.Write(pe.data[start:securityDirOffset])
 
-	// Skip over the Certificate Table entry, which is 8 bytes long.
-	start = securityDirOffset + uint32(8)
-
-	// Hash everything from the end of the Certificate Table entry to the end of
-	// image header, including Section Table (headers).
-	h.Write(pe.data[start:sizeOfHeaders])
-
-	// Create a counter called SUM_OF_BYTES_HASHED, which is not part of the
-	// signature. Set this counter to the SizeOfHeaders field, as specified in
-	// Optional Header Windows-Specific Field.
-	SumOfBytesHashes := sizeOfHeaders
-
-	// Build a temporary table of pointers to all of the section headers in the
-	// image. The NumberOfSections field of COFF File Header indicates how big
-	// the table should be. Do not include any section headers in the table
-	// whose SizeOfRawData field is zero.
-	sections := []Section{}
-	for _, section := range pe.Sections {
-		if section.Header.SizeOfRawData != 0 {
-			sections = append(sections, section)
+	locationSlice := make([]RelRange, 0, len(locationMap))
+	for k, v := range locationMap {
+		if stringInSlice(k, []string{"checksum", "datadir_certtable", "certtable"}) {
+			locationSlice = append(locationSlice, *v)
 		}
 	}
+	sort.Sort(byStart(locationSlice))
 
-	// Using the PointerToRawData field (offset 20) in the referenced
-	// SectionHeader structure as a key, arrange the table's elements in
-	// ascending order. In other words, sort the section headers in ascending
-	// order according to the disk-file offset of the sections.
-	sort.Sort(byPointerToRawData(sections))
-
-	// Walk through the sorted table, load the corresponding section into
-	// memory, and hash the entire section. Use the SizeOfRawData field in the
-	// SectionHeader structure to determine the amount of data to hash.
-	// Add the section’s SizeOfRawData value to SUM_OF_BYTES_HASHED.
-	for _, s := range sections {
-		sectionData := pe.data[s.Header.PointerToRawData : s.Header.PointerToRawData+s.Header.SizeOfRawData]
-		SumOfBytesHashes += s.Header.SizeOfRawData
-		h.Write(sectionData)
+	ranges := make([]*Range, 0, len(locationSlice))
+	start := uint32(0)
+	for _, r := range locationSlice {
+		ranges = append(ranges, &Range{Start: start, End: r.Start})
+		start = r.Start + r.Length
 	}
+	ranges = append(ranges, &Range{Start: start, End: pe.size})
 
-	// Create a value called FILE_SIZE, which is not part of the signature.
-	// Set this value to the image’s file size, acquired from the underlying
-	// file system. If FILE_SIZE is greater than SUM_OF_BYTES_HASHED, the file
-	// contains extra data that must be added to the hash. This data begins at
-	// the SUM_OF_BYTES_HASHED file offset, and its length is:
-	// (File Size) – ((Size of AttributeCertificateTable) + SUM_OF_BYTES_HASHED)
-	if pe.size > SumOfBytesHashes {
-		length := pe.size - (certDirSize + SumOfBytesHashes)
-		extraData := pe.data[SumOfBytesHashes : SumOfBytesHashes+length]
-		h.Write(extraData)
+	var rd io.ReaderAt
+	if pe.f != nil {
+		rd = pe.f
+	} else {
+		rd = bytes.NewReader(pe.data)
 	}
-
-	return h.Sum(nil)
+	hasher := sha256.New()
+	for _, v := range ranges {
+		sr := io.NewSectionReader(rd, int64(v.Start), int64(v.End)-int64(v.Start))
+		io.Copy(hasher, sr)
+	}
+	return hasher.Sum(nil)
 }
 
 // The security directory contains the authenticode signature, which is a digital
@@ -207,37 +289,49 @@ func (pe *File) parseSecurityDirectory(rva, size uint32) error {
 	certInfo := CertInfo{}
 	certHeader := WinCertificate{}
 	certSize := uint32(binary.Size(certHeader))
+	var certContent []byte
 
 	// The virtual address value from the Certificate Table entry in the
 	// Optional Header Data Directory is a file offset to the first attribute
 	// certificate entry.
 	fileOffset := rva
 
+	// PE file can be dual signed by applying multiple signatures, which is
+	// strongly recommended when using deprecated hashing algorithms such as MD5.
 	for {
 		err := pe.structUnpack(&certHeader, fileOffset, certSize)
 		if err != nil {
-			return errSecurityDataDirOutOfBands
+			return ErrOutsideBoundary
 		}
 
 		if fileOffset+certHeader.Length > pe.size {
-			return errSecurityDataDirOutOfBands
+			return ErrOutsideBoundary
 		}
 
-		certContent := pe.data[fileOffset+certSize : fileOffset+certHeader.Length]
+		if certHeader.Length == 0 {
+			return ErrSecurityDataDirInvalid
+		}
+
+		certContent = pe.data[fileOffset+certSize : fileOffset+certHeader.Length]
 		pkcs, err = pkcs7.Parse(certContent)
 		if err != nil {
-			pe.Certificates = &Certificate{Header: certHeader}
+			pe.Certificates = Certificate{Header: certHeader, Raw: certContent}
+			pe.HasCertificate = true
 			return err
 		}
 
 		// The pkcs7.PKCS7 structure contains many fields that we are not
 		// interested to, so create another structure, similar to _CERT_INFO
-		// structure which contains only the imporant information.
+		// structure which contains only the important information.
 		serialNumber := pkcs.Signers[0].IssuerAndSerialNumber.SerialNumber
 		for _, cert := range pkcs.Certificates {
 			if !reflect.DeepEqual(cert.SerialNumber, serialNumber) {
 				continue
 			}
+
+			certInfo.SerialNumber = hex.EncodeToString(cert.SerialNumber.Bytes())
+			certInfo.PublicKeyAlgorithm = cert.PublicKeyAlgorithm
+			certInfo.SignatureAlgorithm = cert.SignatureAlgorithm
 
 			certInfo.NotAfter = cert.NotAfter
 			certInfo.NotBefore = cert.NotBefore
@@ -279,24 +373,28 @@ func (pe *File) parseSecurityDirectory(rva, size uint32) error {
 			break
 		}
 
-		// Verify the signature. This will also verify the chain of trust of the
-		// the end-entity signer cert to one of the root in the truststore.
-		// Let's load the system root certs.
-		var certPool *x509.CertPool
-		skipCertVerification := false
-		certPool, err = x509.SystemCertPool()
-		if err != nil {
-			skipCertVerification = true
-		}
+		// Let's mark the file as signed, then we verify if the
+		// signature is valid.
+		pe.IsSigned = true
 
-		// SystemCertPool() return an error in Windows, so we skip verification
-		// for now.
-		if skipCertVerification {
-			err = pkcs.VerifyWithChain(certPool)
-			if err == nil {
-				isValid = true
+		// Let's load the system root certs.
+		if !pe.opts.DisableCertValidation {
+			var certPool *x509.CertPool
+			if runtime.GOOS == "windows" {
+				certPool, err = loadSystemRoots()
 			} else {
-				isValid = false
+				certPool, err = x509.SystemCertPool()
+			}
+
+			// Verify the signature. This will also verify the chain of trust of the
+			// the end-entity signer cert to one of the root in the trust store.
+			if err == nil {
+				err = pkcs.VerifyWithChain(certPool)
+				if err == nil {
+					isValid = true
+				} else {
+					isValid = false
+				}
 			}
 		}
 
@@ -314,7 +412,73 @@ func (pe *File) parseSecurityDirectory(rva, size uint32) error {
 		fileOffset = nextOffset
 	}
 
-	pe.Certificates = &Certificate{Header: certHeader, Content: pkcs,
-		Info: certInfo, Verified: isValid}
+	pe.Certificates = Certificate{Header: certHeader, Content: *pkcs,
+		Raw: certContent, Info: certInfo, Verified: isValid}
+	pe.HasCertificate = true
 	return nil
+}
+
+// loadSystemsRoots manually downloads all the trusted root certificates
+// in Windows by spawning certutil then adding root certs individually
+// to the cert pool. Initially, when running in windows, go SystemCertPool()
+// used to enumerate all the certificate in the Windows store using
+// (CertEnumCertificatesInStore). Unfortunately, Windows does not ship
+// with all of its root certificates installed. Instead, it downloads them
+// on-demand. As a consequence, this behavior leads to a non-deterministic
+// results. Go team then disabled the loading Windows root certs.
+func loadSystemRoots() (*x509.CertPool, error) {
+
+	needSync := true
+	roots := x509.NewCertPool()
+
+	// Create a temporary dir in the OS temp folder
+	// if it does not exists.
+	dir := filepath.Join(os.TempDir(), "certs")
+	info, err := os.Stat(dir)
+	if os.IsNotExist(err) {
+		if err = os.Mkdir(dir, 0755); err != nil {
+			return roots, err
+		}
+	} else {
+		now := time.Now()
+		modTime := info.ModTime()
+		diff := now.Sub(modTime).Hours()
+		if diff < 24 {
+			needSync = false
+		}
+	}
+
+	// Use certutil to download all the root certs.
+	if needSync {
+		cmd := exec.Command("certutil", "-syncWithWU", dir)
+		out, err := cmd.Output()
+		if err != nil {
+			return roots, err
+		}
+		if !strings.Contains(string(out), "command completed successfully") {
+			return roots, err
+		}
+	}
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return roots, err
+	}
+
+	for _, f := range files {
+		if !strings.HasSuffix(f.Name(), ".crt") {
+			continue
+		}
+		certPath := filepath.Join(dir, f.Name())
+		certData, err := ioutil.ReadFile(certPath)
+		if err != nil {
+			return roots, err
+		}
+
+		if crt, err := x509.ParseCertificate(certData); err == nil {
+			roots.AddCert(crt)
+		}
+	}
+
+	return roots, nil
 }
